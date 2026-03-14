@@ -1,142 +1,30 @@
 import logging
 import asyncio
 import os
-import requests
-import time
-import json
 import sqlite3
 import hashlib
 import html
 import re
+import random
+import requests
 from datetime import datetime, timedelta
+from urllib.parse import urlparse, urljoin
+from bs4 import BeautifulSoup
+from googletrans import Translator
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
 import feedparser
-from urllib.parse import urlparse
-import random
-from googletrans import Translator  # Добавляем переводчик
 
 # --- НАСТРОЙКИ ---
 TOKEN = os.getenv("BOT_TOKEN", "8776445236:AAHiSvhgKMjvLDlTvNVrWr9ozC18XwQY8J4")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003419109291"))
 DATABASE_PATH = "news_bot.db"
+MIN_INTERVAL_HOURS = 1  # Минимум 1 час между постами
+CHECK_INTERVAL_MINUTES = 30  # Проверка источников каждые 30 минут
 
-# --- РАСПИСАНИЕ ПУБЛИКАЦИЙ (6 раз в день) ---
-PUBLISH_TIMES = ["09:00", "12:00", "15:00", "18:00", "21:00", "23:59"]
-
-# --- ИСТОЧНИКИ НОВОСТЕЙ (RSS ленты) ---
-RSS_FEEDS = [
-    # Игровые порталы
-    "https://3dnews.ru/news/rss/",
-    "https://stopgame.ru/rss/news.xml",
-    "https://www.igromania.ru/rss/news.xml",
-    "https://kanobu.ru/rss/",
-    "https://app2top.ru/feed/",
-    "https://dtf.ru/rss",
-    "https://www.gamespot.com/feeds/news/",
-    "https://www.pcgamer.com/rss/",
-    "https://www.rockpapershotgun.com/feed",
-    "https://www.gamedeveloper.com/rss.xml",
-    
-    # Reddit сообщества
-    "https://www.reddit.com/r/gaming/.rss",
-    "https://www.reddit.com/r/pcgaming/.rss",
-    "https://www.reddit.com/r/Games/.rss",
-    "https://www.reddit.com/r/Steam/.rss",
-    "https://www.reddit.com/r/GameDeals/.rss",
-    
-    # Новости индустрии
-    "https://www.eurogamer.net/?format=rss",
-    "https://www.vg247.com/feed",
-    "https://www.polygon.com/rss/index.xml",
-    
-    # Steam и платформы
-    "https://steamcommunity.com/games/593110/announcements/",  # Steam Blog
-]
-
-# --- КЛЮЧЕВЫЕ СЛОВА ДЛЯ ФИЛЬТРАЦИИ (можно расширять) ---
-KEYWORDS = [
-    "steam", "стим", "игра", "game", "gaming", "игровой", 
-    "вышла", "релиз", "обновление", "скидка", "распродажа",
-    "бесплатно", "free", "giveaway", "раздача", "ключи",
-    "инди", "indie", "новинка", "анонс", "трейлер",
-    "создатель", "разработчик", "developer", "студия",
-    "прохождение", "рекорд", "скорость", "100%",
-    "патч", "фикс", "исправление", "мод", "модификация"
-]
-
-# --- ИНИЦИАЛИЗАЦИЯ ПЕРЕВОДЧИКА ---
-translator = Translator()
-
-# === ФУНКЦИИ ОБРАБОТКИ ТЕКСТА ===
-
-def clean_text(text: str) -> str:
-    """
-    Очищает текст:
-    - Заменяет длинные тире (—, –) на обычные дефисы (-)
-    - Удаляет лишние пробелы
-    """
-    if not text:
-        return ""
-    
-    # Заменяем длинные тире на обычные дефисы
-    text = text.replace('—', '-').replace('–', '-')
-    
-    # Удаляем множественные пробелы
-    text = re.sub(r'\s+', ' ', text)
-    
-    # Убираем пробелы в начале и конце
-    text = text.strip()
-    
-    return text
-
-async def translate_to_russian(text: str) -> str:
-    """
-    Переводит текст с английского на русский
-    Если текст уже на русском или перевод не удался, возвращает оригинал
-    """
-    if not text or len(text) < 10:  # Не переводим слишком короткие тексты
-        return text
-    
-    try:
-        # Определяем язык
-        detected = await translator.detect(text)
-        
-        # Если текст уже на русском, не переводим
-        if detected.lang == 'ru':
-            return text
-        
-        # Переводим на русский
-        translated = await translator.translate(text, dest='ru', src='en')
-        result = translated.text
-        
-        # Применяем очистку к переведенному тексту
-        result = clean_text(result)
-        
-        logger.info(f"🟢 Переведено: {text[:30]}... -> {result[:30]}...")
-        return result
-        
-    except Exception as e:
-        logger.error(f"🔴 Ошибка перевода: {e}")
-        return text  # Возвращаем оригинал при ошибке
-
-async def translate_news_item(news_item: dict) -> dict:
-    """
-    Переводит заголовок и описание новости
-    """
-    # Переводим заголовок
-    if news_item['title']:
-        news_item['title'] = await translate_to_russian(news_item['title'])
-    
-    # Переводим описание
-    if news_item['summary']:
-        news_item['summary'] = await translate_to_russian(news_item['summary'])
-    
-    return news_item
-
-# === ИНИЦИАЛИЗАЦИЯ ===
+# --- ИНИЦИАЛИЗАЦИЯ ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -146,30 +34,24 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=TOKEN)
 dp = Dispatcher(bot)
 dp.middleware.setup(LoggingMiddleware())
+translator = Translator()
 
 # === БАЗА ДАННЫХ ===
 def init_database():
-    """Создаёт таблицы в SQLite, если их нет"""
+    """Создаёт таблицы в SQLite"""
     conn = sqlite3.connect(DATABASE_PATH)
     c = conn.cursor()
     
-    # Таблица опубликованных новостей
+    # Опубликованные новости
     c.execute('''CREATE TABLE IF NOT EXISTS posted_news
                  (id TEXT PRIMARY KEY,
                   title TEXT,
-                  link TEXT,
+                  url TEXT UNIQUE,
                   source TEXT,
                   published_at TIMESTAMP,
                   posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
     
-    # Таблица источников (для статистики)
-    c.execute('''CREATE TABLE IF NOT EXISTS sources
-                 (name TEXT PRIMARY KEY,
-                  url TEXT,
-                  last_fetched TIMESTAMP,
-                  total_posts INTEGER DEFAULT 0)''')
-    
-    # Таблица для хранения состояния
+    # Время последнего поста
     c.execute('''CREATE TABLE IF NOT EXISTS bot_state
                  (key TEXT PRIMARY KEY,
                   value TEXT)''')
@@ -178,26 +60,26 @@ def init_database():
     conn.close()
     logger.info("✅ База данных инициализирована")
 
-def is_posted(news_id: str) -> bool:
+def is_posted(url: str) -> bool:
     """Проверяет, публиковалась ли новость"""
     conn = sqlite3.connect(DATABASE_PATH)
     c = conn.cursor()
-    c.execute("SELECT id FROM posted_news WHERE id = ?", (news_id,))
+    c.execute("SELECT id FROM posted_news WHERE url = ?", (url,))
     result = c.fetchone() is not None
     conn.close()
     return result
 
-def mark_as_posted(news_id: str, title: str, link: str, source: str, pub_date: str):
+def mark_as_posted(news_id: str, title: str, url: str, source: str):
     """Отмечает новость как опубликованную"""
     conn = sqlite3.connect(DATABASE_PATH)
     c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO posted_news (id, title, link, source, published_at) VALUES (?, ?, ?, ?, ?)",
-              (news_id, title, link, source, pub_date))
+    c.execute("INSERT OR IGNORE INTO posted_news (id, title, url, source) VALUES (?, ?, ?, ?)",
+              (news_id, title, url, source))
     conn.commit()
     conn.close()
 
 def get_last_post_time() -> datetime:
-    """Получает время последнего успешного поста"""
+    """Время последнего поста"""
     conn = sqlite3.connect(DATABASE_PATH)
     c = conn.cursor()
     c.execute("SELECT value FROM bot_state WHERE key = 'last_post_time'")
@@ -216,152 +98,418 @@ def update_last_post_time():
     conn.commit()
     conn.close()
 
-# === ПАРСИНГ RSS ===
-def parse_rss_feed(feed_url: str, max_items: int = 10):
-    """Парсит RSS ленту и возвращает список новостей"""
-    news_items = []
+def can_post_now() -> bool:
+    """Проверяет, прошёл ли минимальный интервал"""
+    last = get_last_post_time()
+    hours_passed = (datetime.now() - last).total_seconds() / 3600
+    return hours_passed >= MIN_INTERVAL_HOURS
+
+# === ФУНКЦИИ ОБРАБОТКИ ТЕКСТА ===
+
+def clean_text(text: str) -> str:
+    """Очищает текст от HTML и лишних пробелов"""
+    if not text:
+        return ""
+    text = re.sub(r'<[^>]+>', '', text)
+    text = html.unescape(text)
+    text = text.replace('—', '-').replace('–', '-')
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+def extract_game_names(text: str) -> list:
+    """Извлекает названия игр (слова с заглавных, не переводим)"""
+    # Простая эвристика: слова длиной >3, начинающиеся с заглавной
+    words = text.split()
+    games = []
+    for i, word in enumerate(words):
+        if len(word) > 3 and word[0].isupper() and word[1:2].islower():
+            # Проверяем, что это не начало предложения
+            if i == 0 or words[i-1].endswith(('.', '!', '?')):
+                continue
+            games.append(word)
+    return games
+
+async def translate_text(text: str, preserve_game_names: bool = True) -> str:
+    """Переводит текст, сохраняя названия игр"""
+    if not text or len(text) < 20:
+        return text
+    
     try:
-        logger.info(f"🟡 Парсинг RSS: {feed_url}")
-        feed = feedparser.parse(feed_url)
+        # Определяем язык
+        detected = await translator.detect(text)
+        if detected.lang == 'ru':
+            return text
         
-        if feed.bozo:  # Ошибка парсинга
-            logger.warning(f"⚠️ Ошибка парсинга {feed_url}: {feed.bozo_exception}")
-            return []
+        # Сохраняем названия игр
+        game_names = extract_game_names(text) if preserve_game_names else []
         
-        source_name = urlparse(feed_url).netloc.replace('www.', '')
+        # Переводим
+        translated = await translator.translate(text, dest='ru')
+        result = translated.text
         
-        for entry in feed.entries[:max_items]:
-            # Генерируем уникальный ID
-            news_id = hashlib.md5(f"{entry.link}{entry.title}".encode()).hexdigest()
-            
-            # Пропускаем если уже постили
-            if is_posted(news_id):
+        # Возвращаем названия игр (упрощённо)
+        for game in game_names:
+            if game.lower() in text.lower() and game not in result:
+                result += f" ({game})"
+        
+        return clean_text(result)
+    except Exception as e:
+        logger.error(f"Ошибка перевода: {e}")
+        return text
+
+async def rephrase_text(text: str) -> str:
+    """
+    Делает текст уникальным через перефразирование
+    Используем шаблонный метод (без нейросетей для экономии)
+    """
+    if not text:
+        return text
+    
+    # Набор шаблонов для перефразирования
+    templates = [
+        "{}",
+        "Новость: {}",
+        "🔥 {}",
+        "⚡️ {}",
+        "Интересное: {}",
+        "Кстати, {}",
+        "У нас новость: {}",
+        "🤔 {}",
+        "🎮 {}",
+        "👀 {}"
+    ]
+    
+    # Случайный шаблон
+    template = random.choice(templates)
+    
+    # Удаляем восклицательные знаки в конце (для разнообразия)
+    text = re.sub(r'!+$', '', text)
+    
+    return template.format(text)
+
+# === ПАРСЕРЫ САЙТОВ ===
+
+async def parse_stopgame():
+    """Парсит stopgame.ru через RSS"""
+    news = []
+    try:
+        feed = feedparser.parse("https://stopgame.ru/rss/news.xml")
+        for entry in feed.entries[:10]:
+            if is_posted(entry.link):
                 continue
             
-            # Извлекаем дату публикации
-            pub_date = entry.get('published', entry.get('updated', ''))
+            # Очищаем описание
+            summary = clean_text(entry.get('summary', ''))
             
-            # Очищаем описание от HTML
-            summary = entry.get('summary', entry.get('description', ''))
-            summary = re.sub(r'<[^>]+>', '', summary)
-            summary = html.unescape(summary)
-            summary = re.sub(r'\s+', ' ', summary).strip()
-            
-            # Обрезаем до разумной длины
-            if len(summary) > 300:
-                summary = summary[:300].rsplit(' ', 1)[0] + '...'
-            
-            # Извлекаем картинку
+            # Ищем картинку
             image_url = None
             if 'media_content' in entry:
                 for media in entry.media_content:
                     if media.get('type', '').startswith('image'):
                         image_url = media.get('url')
                         break
-            elif 'links' in entry:
-                for link in entry.links:
-                    if link.get('type', '').startswith('image'):
-                        image_url = link.get('href')
-                        break
             
-            # Очищаем заголовок от длинных тире
-            title = clean_text(entry.get('title', 'Без заголовка'))
-            
-            news_items.append({
-                'id': news_id,
-                'title': title,
-                'link': entry.get('link', ''),
+            news.append({
+                'title': entry.title,
+                'url': entry.link,
                 'summary': summary,
                 'image_url': image_url,
-                'source': source_name,
-                'published': pub_date,
-                'raw_data': entry
+                'source': 'stopgame.ru',
+                'raw_date': entry.get('published', '')
+            })
+        logger.info(f"stopgame.ru: {len(news)} новых")
+    except Exception as e:
+        logger.error(f"Ошибка stopgame.ru: {e}")
+    return news
+
+async def parse_gamemag():
+    """Парсит gamemag.ru (HTML)"""
+    news = []
+    try:
+        url = "https://gamemag.ru"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Ищем блоки новостей
+        items = soup.find_all('div', class_=re.compile(r'news|item|post'))
+        
+        for item in items[:15]:
+            # Ищем ссылку
+            link_tag = item.find('a', href=True)
+            if not link_tag:
+                continue
+            
+            link = urljoin(url, link_tag['href'])
+            if is_posted(link):
+                continue
+            
+            # Заголовок
+            title = link_tag.get_text(strip=True)
+            if not title or len(title) < 10:
+                continue
+            
+            # Описание
+            summary = ""
+            summary_tag = item.find('p') or item.find('div', class_=re.compile(r'desc|text'))
+            if summary_tag:
+                summary = summary_tag.get_text(strip=True)[:300]
+            
+            # Картинка
+            image_url = None
+            img_tag = item.find('img')
+            if img_tag and img_tag.get('src'):
+                image_url = urljoin(url, img_tag['src'])
+            
+            news.append({
+                'title': title,
+                'url': link,
+                'summary': summary,
+                'image_url': image_url,
+                'source': 'gamemag.ru',
+                'raw_date': ''
             })
         
-        logger.info(f"🟢 {feed_url}: найдено {len(news_items)} новых новостей")
-        
+        logger.info(f"gamemag.ru: {len(news)} новых")
     except Exception as e:
-        logger.error(f"🔴 Ошибка при парсинге {feed_url}: {e}")
-    
-    return news_items
+        logger.error(f"Ошибка gamemag.ru: {e}")
+    return news
+
+async def parse_dtf():
+    """Парсит dtf.ru/tag/steam"""
+    news = []
+    try:
+        url = "https://dtf.ru/tag/steam"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # DTF использует data-атрибуты
+        items = soup.find_all('article', class_=re.compile(r'content'))
+        
+        for item in items[:15]:
+            link_tag = item.find('a', href=True)
+            if not link_tag:
+                continue
+            
+            link = urljoin(url, link_tag['href'])
+            if is_posted(link):
+                continue
+            
+            title = link_tag.get_text(strip=True)
+            if not title:
+                continue
+            
+            # Описание
+            summary = ""
+            summary_tag = item.find('div', class_=re.compile(r'text|desc'))
+            if summary_tag:
+                summary = summary_tag.get_text(strip=True)[:300]
+            
+            # Картинка
+            image_url = None
+            img_tag = item.find('img')
+            if img_tag and img_tag.get('src'):
+                image_url = urljoin(url, img_tag['src'])
+            
+            news.append({
+                'title': title,
+                'url': link,
+                'summary': summary,
+                'image_url': image_url,
+                'source': 'dtf.ru',
+                'raw_date': ''
+            })
+        
+        logger.info(f"dtf.ru: {len(news)} новых")
+    except Exception as e:
+        logger.error(f"Ошибка dtf.ru: {e}")
+    return news
+
+async def parse_shazoo():
+    """Парсит shazoo.ru/tags/169/steam"""
+    news = []
+    try:
+        url = "https://shazoo.ru/tags/169/steam"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        items = soup.find_all('div', class_=re.compile(r'post|item'))
+        
+        for item in items[:15]:
+            link_tag = item.find('a', href=True)
+            if not link_tag:
+                continue
+            
+            link = urljoin(url, link_tag['href'])
+            if is_posted(link):
+                continue
+            
+            title = link_tag.get_text(strip=True)
+            if not title:
+                continue
+            
+            # Описание
+            summary = ""
+            summary_tag = item.find('p') or item.find('div', class_=re.compile(r'desc|text'))
+            if summary_tag:
+                summary = summary_tag.get_text(strip=True)[:300]
+            
+            # Картинка
+            image_url = None
+            img_tag = item.find('img')
+            if img_tag and img_tag.get('src'):
+                image_url = urljoin(url, img_tag['src'])
+            
+            news.append({
+                'title': title,
+                'url': link,
+                'summary': summary,
+                'image_url': image_url,
+                'source': 'shazoo.ru',
+                'raw_date': ''
+            })
+        
+        logger.info(f"shazoo.ru: {len(news)} новых")
+    except Exception as e:
+        logger.error(f"Ошибка shazoo.ru: {e}")
+    return news
+
+async def parse_playground():
+    """Парсит playground.ru/news"""
+    news = []
+    try:
+        url = "https://www.playground.ru/news"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        items = soup.find_all('div', class_=re.compile(r'news|post|item'))
+        
+        for item in items[:15]:
+            link_tag = item.find('a', href=True)
+            if not link_tag:
+                continue
+            
+            link = urljoin(url, link_tag['href'])
+            if is_posted(link):
+                continue
+            
+            title = link_tag.get_text(strip=True)
+            if not title:
+                continue
+            
+            # Описание
+            summary = ""
+            summary_tag = item.find('p') or item.find('div', class_=re.compile(r'desc|text'))
+            if summary_tag:
+                summary = summary_tag.get_text(strip=True)[:300]
+            
+            # Картинка
+            image_url = None
+            img_tag = item.find('img')
+            if img_tag and img_tag.get('src'):
+                image_url = urljoin(url, img_tag['src'])
+            
+            news.append({
+                'title': title,
+                'url': link,
+                'summary': summary,
+                'image_url': image_url,
+                'source': 'playground.ru',
+                'raw_date': ''
+            })
+        
+        logger.info(f"playground.ru: {len(news)} новых")
+    except Exception as e:
+        logger.error(f"Ошибка playground.ru: {e}")
+    return news
 
 # === СБОР ВСЕХ НОВОСТЕЙ ===
 async def fetch_all_news():
-    """Собирает новости из всех источников и переводит их"""
+    """Собирает новости из всех источников"""
     all_news = []
     
-    for feed_url in RSS_FEEDS:
-        news = parse_rss_feed(feed_url, max_items=5)
-        all_news.extend(news)
-        await asyncio.sleep(1)  # Не ддосим сервера
+    # Парсим все источники параллельно
+    parsers = [
+        parse_stopgame(),
+        parse_gamemag(),
+        parse_dtf(),
+        parse_shazoo(),
+        parse_playground()
+    ]
     
-    # Переводим новости
-    translated_news = []
-    for news_item in all_news:
-        translated_item = await translate_news_item(news_item)
-        translated_news.append(translated_item)
-        await asyncio.sleep(0.5)  # Не перегружаем API переводчика
+    results = await asyncio.gather(*parsers, return_exceptions=True)
     
-    # Перемешиваем, чтобы не было доминации одного источника
-    random.shuffle(translated_news)
+    for result in results:
+        if isinstance(result, Exception):
+            logger.error(f"Ошибка парсера: {result}")
+        elif isinstance(result, list):
+            all_news.extend(result)
     
-    logger.info(f"📊 Всего собрано: {len(translated_news)} новых новостей (после перевода)")
-    return translated_news
+    logger.info(f"📊 Всего новых новостей: {len(all_news)}")
+    
+    # Перемешиваем, чтобы не было доминирования одного источника
+    random.shuffle(all_news)
+    return all_news
 
-# === ПОИСК КАРТИНКИ ===
-def search_image(query: str) -> str | None:
-    """Ищет картинку по запросу (заглушка)"""
-    # TODO: Добавить Google Custom Search API
-    # Пока возвращаем None
-    return None
-
-# === ФОРМАТИРОВАНИЕ ПОСТА ===
-def format_post(news_item) -> str:
-    """Форматирует новость в пост для Telegram"""
+# === ПОДГОТОВКА ПОСТА ===
+async def prepare_post(news_item):
+    """Переводит, перефразирует и готовит пост"""
     
-    # Заголовок жирным
-    post = f"<b>{news_item['title']}</b>\n\n"
+    # Заголовок
+    title = await translate_text(news_item['title'])
+    title = await rephrase_text(title)
     
-    # Описание (уже переведено и очищено от длинных тире)
-    if news_item['summary']:
-        post += f"{news_item['summary']}\n\n"
+    # Описание
+    summary = news_item['summary']
+    if summary and len(summary) > 50:
+        summary = await translate_text(summary)
+        summary = await rephrase_text(summary)
     
-    # Реакции (символами, не кнопками)
+    # Формируем пост
+    post = f"<b>{title}</b>\n\n"
+    if summary:
+        post += f"{summary}\n\n"
+    
+    # Подпись
     post += "❤️ / 👎\n\n"
-    
-    # Подпись с ссылкой на канал
     post += '👉 <a href="https://t.me/gamesdevil">Game Devil</a>'
     
-    return post
+    return {
+        'text': post,
+        'image': news_item.get('image_url'),
+        'url': news_item['url'],
+        'title': title,
+        'source': news_item['source']
+    }
 
-# === ПУБЛИКАЦИЯ ПОСТА ===
-async def publish_news(news_item):
-    """Публикует новость в канал"""
+# === ПУБЛИКАЦИЯ ===
+async def publish_post(prepared_post):
+    """Публикует пост в канал"""
     try:
-        post_text = format_post(news_item)
-        
-        # Пробуем отправить с картинкой
-        if news_item.get('image_url'):
+        if prepared_post['image']:
             try:
                 await bot.send_photo(
                     chat_id=CHANNEL_ID,
-                    photo=news_item['image_url'],
-                    caption=post_text,
+                    photo=prepared_post['image'],
+                    caption=prepared_post['text'],
                     parse_mode="HTML"
                 )
-                logger.info(f"🟢 Опубликовано с фото: {news_item['title'][:50]}...")
+                logger.info(f"🟢 Опубликовано с фото: {prepared_post['title'][:50]}...")
                 return True
             except Exception as e:
                 logger.warning(f"⚠️ Не удалось отправить с фото: {e}")
         
-        # Если нет картинки или ошибка, отправляем без фото
+        # Без фото
         await bot.send_message(
             chat_id=CHANNEL_ID,
-            text=post_text,
+            text=prepared_post['text'],
             parse_mode="HTML",
             disable_web_page_preview=False
         )
-        logger.info(f"🟢 Опубликовано без фото: {news_item['title'][:50]}...")
+        logger.info(f"🟢 Опубликовано без фото: {prepared_post['title'][:50]}...")
         return True
         
     except Exception as e:
@@ -370,125 +518,91 @@ async def publish_news(news_item):
 
 # === ОСНОВНАЯ ЗАДАЧА ===
 async def news_job():
-    """Главная задача: сбор и публикация новостей"""
-    logger.info("🚀 Запуск задачи сбора новостей")
+    """Главная задача: сбор и публикация"""
+    logger.info("🚀 Запуск сбора новостей")
+    
+    # Проверяем интервал
+    if not can_post_now():
+        next_post = get_last_post_time() + timedelta(hours=MIN_INTERVAL_HOURS)
+        logger.info(f"⏳ Слишком рано. Следующий пост после {next_post.strftime('%H:%M')}")
+        return
     
     # Собираем новости
     all_news = await fetch_all_news()
     
     if not all_news:
-        logger.info("📭 Новых новостей нет")
+        logger.info("📭 Новостей нет")
         return
     
-    # Публикуем ТОЛЬКО 1 новость за раз (остальные подождут следующего раза)
-    published = 0
-    for news in all_news[:1]:  # Берем только первую новость
-        success = await publish_news(news)
-        if success:
-            mark_as_posted(
-                news['id'],
-                news['title'],
-                news['link'],
-                news['source'],
-                news.get('published', '')
-            )
-            published += 1
-            break  # Останавливаемся после первой публикации
+    # Берём первую новость
+    news_item = all_news[0]
     
-    update_last_post_time()
-    logger.info(f"✅ Опубликовано {published} новостей")
+    # Готовим пост
+    prepared = await prepare_post(news_item)
+    
+    # Публикуем
+    success = await publish_post(prepared)
+    
+    if success:
+        # Генерируем ID
+        news_id = hashlib.md5(news_item['url'].encode()).hexdigest()
+        mark_as_posted(news_id, news_item['title'], news_item['url'], news_item['source'])
+        update_last_post_time()
+        logger.info(f"✅ Опубликовано: {news_item['url']}")
 
 # === ПЛАНИРОВЩИК ===
 async def scheduler():
-    """Проверяет время и запускает публикации по расписанию"""
-    logger.info("⏰ Планировщик запущен")
-    
-    last_run_date = None
-    last_run_time = None
+    """Запускает сбор по расписанию"""
+    logger.info(f"⏰ Планировщик запущен (интервал {CHECK_INTERVAL_MINUTES} мин)")
     
     while True:
         now = datetime.now()
-        current_time = now.strftime("%H:%M")
-        current_date = now.date()
+        logger.info(f"🔍 Проверка источников в {now.strftime('%H:%M')}")
         
-        # Проверяем, нужно ли запускать публикацию
-        if current_time in PUBLISH_TIMES:
-            # Проверяем, не запускали ли мы уже в это время сегодня
-            if last_run_date != current_date or last_run_time != current_time:
-                logger.info(f"⏰ Настало время {current_time}, запускаю публикацию")
-                await news_job()
-                last_run_date = current_date
-                last_run_time = current_time
-                # Ждём минуту, чтобы не запустить повторно
-                await asyncio.sleep(60)
+        await news_job()
         
-        # Проверяем каждые 30 секунд
-        await asyncio.sleep(30)
+        # Ждём до следующей проверки
+        await asyncio.sleep(CHECK_INTERVAL_MINUTES * 60)
 
 # === КОМАНДЫ ===
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
-    """Приветствие"""
     await message.answer(
         "<b>📰 Новостной бот для @gamesdevil</b>\n\n"
-        "Я автоматически собираю новости из игровой индустрии "
-        "и публикую их в канал по расписанию.\n\n"
-        "✅ Новости переводятся на русский\n"
-        "✅ Удаляются длинные тире\n"
-        "✅ 1 пост за раз (6 раз в день)\n\n"
-        "Доступные команды:\n"
-        "/stats — статистика работы\n"
-        "/post — ручная публикация (для админа)\n"
-        "/sources — список источников",
+        "Я автоматически собираю новости из игровых источников "
+        "и публикую их в канал.\n\n"
+        f"⏱ Интервал: {MIN_INTERVAL_HOURS} час между постами\n"
+        f"🔍 Проверка: каждые {CHECK_INTERVAL_MINUTES} мин\n"
+        f"📚 Источников: 5\n\n"
+        "Команды:\n"
+        "/stats — статистика\n"
+        "/post — ручная публикация",
         parse_mode="HTML"
     )
 
 @dp.message_handler(commands=['stats'])
 async def cmd_stats(message: types.Message):
-    """Статистика работы"""
     conn = sqlite3.connect(DATABASE_PATH)
     c = conn.cursor()
-    
     c.execute("SELECT COUNT(*) FROM posted_news")
-    total_posts = c.fetchone()[0]
-    
-    c.execute("SELECT COUNT(DISTINCT source) FROM posted_news")
-    total_sources = c.fetchone()[0]
-    
+    total = c.fetchone()[0]
     c.execute("SELECT MAX(posted_at) FROM posted_news")
-    last_post = c.fetchone()[0]
-    
+    last = c.fetchone()[0]
     conn.close()
     
-    stats_text = (
-        f"<b>📊 Статистика бота</b>\n\n"
-        f"📝 Всего постов: {total_posts}\n"
-        f"📡 Источников: {total_sources}\n"
-        f"🕐 Последний пост: {last_post or 'никогда'}\n"
-        f"⏰ Расписание: {', '.join(PUBLISH_TIMES)}"
+    await message.answer(
+        f"<b>📊 Статистика</b>\n\n"
+        f"📝 Всего постов: {total}\n"
+        f"🕐 Последний: {last or 'никогда'}\n"
+        f"⏱ Интервал: {MIN_INTERVAL_HOURS} ч",
+        parse_mode="HTML"
     )
-    
-    await message.answer(stats_text, parse_mode="HTML")
 
 @dp.message_handler(commands=['post'])
 async def cmd_post(message: types.Message):
-    """Ручной запуск публикации"""
-    await message.answer("⏳ Запускаю сбор новостей...")
+    await message.answer("⏳ Запускаю...")
     await news_job()
-    await message.answer("✅ Готово!")
-
-@dp.message_handler(commands=['sources'])
-async def cmd_sources(message: types.Message):
-    """Список источников"""
-    sources_text = "<b>📡 Источники новостей:</b>\n\n"
-    for i, feed in enumerate(RSS_FEEDS[:10], 1):
-        name = urlparse(feed).netloc.replace('www.', '')
-        sources_text += f"{i}. {name}\n"
-    
-    if len(RSS_FEEDS) > 10:
-        sources_text += f"\n...и ещё {len(RSS_FEEDS) - 10} источников"
-    
-    await message.answer(sources_text, parse_mode="HTML")
+    await message.answer("✅ Готово")
 
 # === HEALTH CHECK ===
 async def handle_health(request):
@@ -504,16 +618,9 @@ async def run_health_server():
 
 # === MAIN ===
 async def main():
-    # Инициализация
     init_database()
-    
-    # Запуск health check
     await run_health_server()
-    
-    # Запуск планировщика
     asyncio.create_task(scheduler())
-    
-    # Запуск бота
     logger.info("🤖 Бот запущен")
     await dp.start_polling()
 
