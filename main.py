@@ -16,6 +16,7 @@ from aiohttp import web
 import feedparser
 from urllib.parse import urlparse
 import random
+from googletrans import Translator  # Добавляем переводчик
 
 # --- НАСТРОЙКИ ---
 TOKEN = os.getenv("BOT_TOKEN", "8776445236:AAHiSvhgKMjvLDlTvNVrWr9ozC18XwQY8J4")
@@ -66,9 +67,74 @@ KEYWORDS = [
     "патч", "фикс", "исправление", "мод", "модификация"
 ]
 
-# --- НАСТРОЙКИ ПОИСКА КАРТИНОК ---
-GOOGLE_API_KEY = None  # Можно добавить позже
-GOOGLE_CX = None       # Можно добавить позже
+# --- ИНИЦИАЛИЗАЦИЯ ПЕРЕВОДЧИКА ---
+translator = Translator()
+
+# === ФУНКЦИИ ОБРАБОТКИ ТЕКСТА ===
+
+def clean_text(text: str) -> str:
+    """
+    Очищает текст:
+    - Заменяет длинные тире (—, –) на обычные дефисы (-)
+    - Удаляет лишние пробелы
+    """
+    if not text:
+        return ""
+    
+    # Заменяем длинные тире на обычные дефисы
+    text = text.replace('—', '-').replace('–', '-')
+    
+    # Удаляем множественные пробелы
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Убираем пробелы в начале и конце
+    text = text.strip()
+    
+    return text
+
+async def translate_to_russian(text: str) -> str:
+    """
+    Переводит текст с английского на русский
+    Если текст уже на русском или перевод не удался, возвращает оригинал
+    """
+    if not text or len(text) < 10:  # Не переводим слишком короткие тексты
+        return text
+    
+    try:
+        # Определяем язык
+        detected = await translator.detect(text)
+        
+        # Если текст уже на русском, не переводим
+        if detected.lang == 'ru':
+            return text
+        
+        # Переводим на русский
+        translated = await translator.translate(text, dest='ru', src='en')
+        result = translated.text
+        
+        # Применяем очистку к переведенному тексту
+        result = clean_text(result)
+        
+        logger.info(f"🟢 Переведено: {text[:30]}... -> {result[:30]}...")
+        return result
+        
+    except Exception as e:
+        logger.error(f"🔴 Ошибка перевода: {e}")
+        return text  # Возвращаем оригинал при ошибке
+
+async def translate_news_item(news_item: dict) -> dict:
+    """
+    Переводит заголовок и описание новости
+    """
+    # Переводим заголовок
+    if news_item['title']:
+        news_item['title'] = await translate_to_russian(news_item['title'])
+    
+    # Переводим описание
+    if news_item['summary']:
+        news_item['summary'] = await translate_to_russian(news_item['summary'])
+    
+    return news_item
 
 # === ИНИЦИАЛИЗАЦИЯ ===
 logging.basicConfig(
@@ -198,9 +264,12 @@ def parse_rss_feed(feed_url: str, max_items: int = 10):
                         image_url = link.get('href')
                         break
             
+            # Очищаем заголовок от длинных тире
+            title = clean_text(entry.get('title', 'Без заголовка'))
+            
             news_items.append({
                 'id': news_id,
-                'title': entry.get('title', 'Без заголовка'),
+                'title': title,
                 'link': entry.get('link', ''),
                 'summary': summary,
                 'image_url': image_url,
@@ -218,7 +287,7 @@ def parse_rss_feed(feed_url: str, max_items: int = 10):
 
 # === СБОР ВСЕХ НОВОСТЕЙ ===
 async def fetch_all_news():
-    """Собирает новости из всех источников"""
+    """Собирает новости из всех источников и переводит их"""
     all_news = []
     
     for feed_url in RSS_FEEDS:
@@ -226,11 +295,18 @@ async def fetch_all_news():
         all_news.extend(news)
         await asyncio.sleep(1)  # Не ддосим сервера
     
-    # Перемешиваем, чтобы не было доминации одного источника
-    random.shuffle(all_news)
+    # Переводим новости
+    translated_news = []
+    for news_item in all_news:
+        translated_item = await translate_news_item(news_item)
+        translated_news.append(translated_item)
+        await asyncio.sleep(0.5)  # Не перегружаем API переводчика
     
-    logger.info(f"📊 Всего собрано: {len(all_news)} новых новостей")
-    return all_news
+    # Перемешиваем, чтобы не было доминации одного источника
+    random.shuffle(translated_news)
+    
+    logger.info(f"📊 Всего собрано: {len(translated_news)} новых новостей (после перевода)")
+    return translated_news
 
 # === ПОИСК КАРТИНКИ ===
 def search_image(query: str) -> str | None:
@@ -246,12 +322,9 @@ def format_post(news_item) -> str:
     # Заголовок жирным
     post = f"<b>{news_item['title']}</b>\n\n"
     
-    # Описание
+    # Описание (уже переведено и очищено от длинных тире)
     if news_item['summary']:
         post += f"{news_item['summary']}\n\n"
-    
-    # Ссылка на источник
-    post += f"🔗 <a href='{news_item['link']}'>Читать полностью</a>\n\n"
     
     # Реакции (символами, не кнопками)
     post += "❤️ / 👎\n\n"
@@ -307,9 +380,9 @@ async def news_job():
         logger.info("📭 Новых новостей нет")
         return
     
-    # Публикуем до 5 новостей за раз
+    # Публикуем ТОЛЬКО 1 новость за раз (остальные подождут следующего раза)
     published = 0
-    for news in all_news[:5]:
+    for news in all_news[:1]:  # Берем только первую новость
         success = await publish_news(news)
         if success:
             mark_as_posted(
@@ -320,7 +393,7 @@ async def news_job():
                 news.get('published', '')
             )
             published += 1
-            await asyncio.sleep(2)  # Пауза между постами
+            break  # Останавливаемся после первой публикации
     
     update_last_post_time()
     logger.info(f"✅ Опубликовано {published} новостей")
@@ -330,16 +403,24 @@ async def scheduler():
     """Проверяет время и запускает публикации по расписанию"""
     logger.info("⏰ Планировщик запущен")
     
+    last_run_date = None
+    last_run_time = None
+    
     while True:
         now = datetime.now()
         current_time = now.strftime("%H:%M")
+        current_date = now.date()
         
         # Проверяем, нужно ли запускать публикацию
         if current_time in PUBLISH_TIMES:
-            logger.info(f"⏰ Настало время {current_time}, запускаю публикацию")
-            await news_job()
-            # Ждём минуту, чтобы не запустить повторно
-            await asyncio.sleep(60)
+            # Проверяем, не запускали ли мы уже в это время сегодня
+            if last_run_date != current_date or last_run_time != current_time:
+                logger.info(f"⏰ Настало время {current_time}, запускаю публикацию")
+                await news_job()
+                last_run_date = current_date
+                last_run_time = current_time
+                # Ждём минуту, чтобы не запустить повторно
+                await asyncio.sleep(60)
         
         # Проверяем каждые 30 секунд
         await asyncio.sleep(30)
@@ -352,6 +433,9 @@ async def cmd_start(message: types.Message):
         "<b>📰 Новостной бот для @gamesdevil</b>\n\n"
         "Я автоматически собираю новости из игровой индустрии "
         "и публикую их в канал по расписанию.\n\n"
+        "✅ Новости переводятся на русский\n"
+        "✅ Удаляются длинные тире\n"
+        "✅ 1 пост за раз (6 раз в день)\n\n"
         "Доступные команды:\n"
         "/stats — статистика работы\n"
         "/post — ручная публикация (для админа)\n"
