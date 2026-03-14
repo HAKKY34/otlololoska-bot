@@ -8,7 +8,7 @@ import re
 import random
 import requests
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, quote
 from bs4 import BeautifulSoup
 from googletrans import Translator
 from aiogram import Bot, Dispatcher, types
@@ -16,19 +16,27 @@ from aiogram.contrib.middlewares.logging import LoggingMiddleware
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
 import feedparser
+import time
 
 # --- НАСТРОЙКИ ---
 TOKEN = os.getenv("BOT_TOKEN", "8776445236:AAHiSvhgKMjvLDlTvNVrWr9ozC18XwQY8J4")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003419109291"))
 DATABASE_PATH = "news_bot.db"
 
-# Интервал между постами (в минутах) для 10-20 постов в день
-POST_INTERVAL_MINUTES = 72  # 1440/72 = 20 постов в день
-CHECK_INTERVAL_MINUTES = 15  # Проверка сайтов каждые 15 минут
+# Google Custom Search API (бесплатно 100 запросов/день)
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")  # Получи здесь: https://developers.google.com/custom-search/v1/introduction
+GOOGLE_CX = os.getenv("GOOGLE_CX", "")  # ID поисковой системы: https://programmablesearchengine.google.com/
+
+# Интервал между постами
+POST_INTERVAL_MINUTES = 72  # ~20 постов в день
+CHECK_INTERVAL_MINUTES = 15
 
 # Таймауты
 REQUEST_TIMEOUT = 10
-PARSER_TIMEOUT = 20  # Чуть больше на 8 сайтов
+PARSER_TIMEOUT = 25
+
+# Флаг для предотвращения двойной публикации
+_publishing_lock = False
 
 # --- ИНИЦИАЛИЗАЦИЯ ---
 logging.basicConfig(
@@ -187,10 +195,58 @@ async def rephrase_text(text: str) -> str:
         return f"{emoji} {text}"
     return text
 
-# === ПАРСЕРЫ (8 ИСТОЧНИКОВ) ===
+# === ПОИСК КАРТИНКИ ===
+def search_image(query: str) -> str | None:
+    """
+    Ищет картинку через Google Custom Search API
+    Бесплатно: 100 запросов/день [citation:1][citation:4]
+    """
+    if not GOOGLE_API_KEY or not GOOGLE_CX:
+        logger.warning("⚠️ Google API не настроен, поиск картинок отключён")
+        return None
+    
+    try:
+        # Очищаем запрос от лишних символов
+        search_query = re.sub(r'[^\w\s]', ' ', query)
+        search_query = quote(search_query[:100])  # Ограничиваем длину
+        
+        url = "https://www.googleapis.com/customsearch/v1"
+        params = {
+            'key': GOOGLE_API_KEY,
+            'cx': GOOGLE_CX,
+            'q': search_query,
+            'searchType': 'image',
+            'num': 3,  # Просим 3 картинки
+            'imgSize': 'medium',  # Не слишком большие
+            'fileType': 'jpg,png',  # Только эти форматы
+            'safe': 'active'  # Безопасный поиск
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        data = response.json()
+        
+        if 'items' in data:
+            for item in data['items']:
+                image_url = item['link']
+                
+                # Базовая проверка на водяные знаки (по домену)
+                bad_domains = ['shutterstock', 'istock', 'gettyimages', 'depositphotos', '123rf']
+                if not any(domain in image_url.lower() for domain in bad_domains):
+                    # Проверяем, что картинка доступна
+                    img_check = requests.head(image_url, timeout=5)
+                    if img_check.status_code == 200:
+                        logger.info(f"🖼 Найдена картинка: {image_url[:100]}...")
+                        return image_url
+        
+        logger.info("❌ Картинка не найдена")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Ошибка поиска картинки: {e}")
+        return None
 
+# === ПАРСЕРЫ ===
 async def parse_stopgame():
-    """1. stopgame.ru"""
     news = []
     try:
         feed = feedparser.parse("https://stopgame.ru/rss/news.xml")
@@ -209,7 +265,6 @@ async def parse_stopgame():
     return news
 
 async def parse_gamemag():
-    """2. gamemag.ru"""
     news = []
     try:
         url = "https://gamemag.ru"
@@ -242,7 +297,6 @@ async def parse_gamemag():
     return news
 
 async def parse_dtf():
-    """3. dtf.ru/tag/steam"""
     news = []
     try:
         url = "https://dtf.ru/tag/steam"
@@ -271,7 +325,6 @@ async def parse_dtf():
     return news
 
 async def parse_shazoo():
-    """4. shazoo.ru/tags/169/steam"""
     news = []
     try:
         url = "https://shazoo.ru/tags/169/steam"
@@ -300,7 +353,6 @@ async def parse_shazoo():
     return news
 
 async def parse_playground():
-    """5. playground.ru/news"""
     news = []
     try:
         url = "https://www.playground.ru/news"
@@ -329,7 +381,6 @@ async def parse_playground():
     return news
 
 async def parse_playground_freebies():
-    """6. playground.ru/news/freebies (раздачи)"""
     news = []
     try:
         url = "https://www.playground.ru/news/freebies"
@@ -358,7 +409,6 @@ async def parse_playground_freebies():
     return news
 
 async def parse_championat():
-    """7. championat.com/tags/29577-steam/news/"""
     news = []
     try:
         url = "https://www.championat.com/tags/29577-steam/news/"
@@ -387,7 +437,6 @@ async def parse_championat():
     return news
 
 async def parse_iz():
-    """8. iz.ru/tag/steam"""
     news = []
     try:
         url = "https://iz.ru/tag/steam"
@@ -415,7 +464,7 @@ async def parse_iz():
         logger.error(f"Ошибка iz.ru: {e}")
     return news
 
-# === СБОР СО ВСЕХ 8 ИСТОЧНИКОВ ===
+# === СБОР НОВОСТЕЙ ===
 async def run_parser_with_timeout(parser_func):
     try:
         return await asyncio.wait_for(parser_func(), timeout=PARSER_TIMEOUT)
@@ -427,7 +476,7 @@ async def run_parser_with_timeout(parser_func):
         return []
 
 async def collect_news_to_queue():
-    """Собирает новости со всех 8 сайтов"""
+    """Собирает новости со всех сайтов"""
     logger.info("🔍 Сканирую 8 источников...")
     
     parsers = [
@@ -452,14 +501,24 @@ async def collect_news_to_queue():
     queue_size = get_queue_size()
     logger.info(f"📊 Добавлено в очередь: {total_new} новостей. Всего в очереди: {queue_size}")
 
-# === ПУБЛИКАЦИЯ ===
+# === ПУБЛИКАЦИЯ С КАРТИНКОЙ ===
 async def prepare_post(news_item):
+    """Готовит пост с картинкой"""
     title = await translate_text(news_item['title'])
     title = await rephrase_text(title)
     
     summary = news_item.get('summary', '')
     if summary:
         summary = await translate_text(summary)
+    
+    # Ищем картинку по заголовку
+    image_url = None
+    if GOOGLE_API_KEY and GOOGLE_CX:
+        logger.info(f"🔍 Ищу картинку для: {title[:50]}...")
+        image_url = search_image(title)
+        if image_url:
+            # Небольшая задержка, чтобы не спамить API
+            await asyncio.sleep(1)
     
     post = f"<b>{title}</b>\n\n"
     if summary:
@@ -468,41 +527,76 @@ async def prepare_post(news_item):
     post += "❤️ / 👎\n\n"
     post += '👉 <a href="https://t.me/gamesdevil">Game Devil</a>'
     
-    return post
+    return post, image_url
 
 async def publish_from_queue():
-    last_time = get_last_post_time()
-    minutes_passed = (datetime.now() - last_time).total_seconds() / 60
+    """Публикует одну новость из очереди с блокировкой от двойных постов"""
+    global _publishing_lock
     
-    if minutes_passed < POST_INTERVAL_MINUTES:
-        next_post = last_time + timedelta(minutes=POST_INTERVAL_MINUTES)
-        logger.info(f"⏳ Интервал: прошло {minutes_passed:.0f} мин, нужно до {next_post.strftime('%H:%M')}")
+    # Блокировка от двойной публикации [citation:7]
+    if _publishing_lock:
+        logger.warning("⚠️ Публикация уже выполняется, пропускаю")
         return False
     
-    news_item = get_from_queue()
-    if not news_item:
-        logger.info("📭 Очередь пуста")
-        return False
-    
-    logger.info(f"📝 Беру из очереди: {news_item['title'][:50]}...")
-    post_text = await prepare_post(news_item)
+    _publishing_lock = True
     
     try:
-        await bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=post_text,
-            parse_mode="HTML",
-            disable_web_page_preview=False
-        )
-        mark_as_posted(news_item['url'], news_item['title'], news_item['source'])
-        remove_from_queue(news_item['id'])
-        update_last_post_time()
-        logger.info(f"✅ Опубликовано: {news_item['title'][:50]}...")
-        logger.info(f"📊 Осталось в очереди: {get_queue_size()}")
-        return True
-    except Exception as e:
-        logger.error(f"❌ Ошибка публикации: {e}")
-        return False
+        # Проверяем интервал
+        last_time = get_last_post_time()
+        minutes_passed = (datetime.now() - last_time).total_seconds() / 60
+        
+        if minutes_passed < POST_INTERVAL_MINUTES:
+            next_post = last_time + timedelta(minutes=POST_INTERVAL_MINUTES)
+            logger.info(f"⏳ Интервал: прошло {minutes_passed:.0f} мин, нужно до {next_post.strftime('%H:%M')}")
+            return False
+        
+        # Берём новость из очереди
+        news_item = get_from_queue()
+        if not news_item:
+            logger.info("📭 Очередь пуста")
+            return False
+        
+        logger.info(f"📝 Беру из очереди: {news_item['title'][:50]}...")
+        
+        # Готовим пост и ищем картинку
+        post_text, image_url = await prepare_post(news_item)
+        
+        # Публикуем с картинкой или без
+        try:
+            if image_url:
+                await bot.send_photo(
+                    chat_id=CHANNEL_ID,
+                    photo=image_url,
+                    caption=post_text,
+                    parse_mode="HTML"
+                )
+                logger.info(f"🖼 Опубликовано с фото")
+            else:
+                await bot.send_message(
+                    chat_id=CHANNEL_ID,
+                    text=post_text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=False
+                )
+                logger.info(f"📝 Опубликовано без фото")
+            
+            # Отмечаем как опубликованное
+            mark_as_posted(news_item['url'], news_item['title'], news_item['source'])
+            remove_from_queue(news_item['id'])
+            update_last_post_time()
+            
+            logger.info(f"✅ Успешно: {news_item['title'][:50]}...")
+            logger.info(f"📊 Осталось в очереди: {get_queue_size()}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка публикации: {e}")
+            return False
+            
+    finally:
+        # Снимаем блокировку [citation:7]
+        _publishing_lock = False
 
 # === ПЛАНИРОВЩИКИ ===
 async def collector_scheduler():
@@ -515,15 +609,19 @@ async def publisher_scheduler():
     logger.info(f"📢 Паблишер запущен (интервал {POST_INTERVAL_MINUTES} мин)")
     while True:
         await publish_from_queue()
-        await asyncio.sleep(60)
+        # Проверяем каждые 2 минуты, но публикация только когда проходит интервал
+        await asyncio.sleep(120)
 
 # === КОМАНДЫ ===
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
     queue_size = get_queue_size()
+    google_status = "✅" if GOOGLE_API_KEY and GOOGLE_CX else "❌"
+    
     await message.answer(
         f"<b>📰 Game Devil News Bot</b>\n\n"
         f"✅ Мониторю 8 игровых сайтов 24/7\n"
+        f"🖼 Поиск картинок: {google_status}\n"
         f"⏱ Интервал: {POST_INTERVAL_MINUTES} мин (~{1440//POST_INTERVAL_MINUTES} постов/день)\n"
         f"🔍 Проверка источников: каждые {CHECK_INTERVAL_MINUTES} мин\n"
         f"📚 В очереди сейчас: {queue_size} новостей\n\n"
@@ -566,11 +664,11 @@ async def cmd_post(message: types.Message):
     if success:
         await message.answer("✅ Пост опубликован!")
     else:
-        await message.answer("❌ Не удалось опубликовать (нет новостей или рано)")
+        await message.answer("❌ Не удалось опубликовать (нет новостей, рано или идёт другая публикация)")
 
 # === HEALTH CHECK ===
 async def handle_health(request):
-    return web.Response(text=f"OK\nQueue: {get_queue_size()}")
+    return web.Response(text=f"OK\nQueue: {get_queue_size()}\nLock: {_publishing_lock}")
 
 async def run_health_server():
     app = web.Application()
@@ -586,7 +684,7 @@ async def main():
     await run_health_server()
     asyncio.create_task(collector_scheduler())
     asyncio.create_task(publisher_scheduler())
-    logger.info("🤖 Бот запущен с 8 источниками")
+    logger.info("🤖 Бот запущен с 8 источниками и поиском картинок")
     logger.info(f"⏱ Интервал: {POST_INTERVAL_MINUTES} мин (~{1440//POST_INTERVAL_MINUTES} постов/день)")
     await dp.start_polling()
 
