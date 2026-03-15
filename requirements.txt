@@ -3,4 +3,3 @@ aiohttp==3.8.6
 beautifulsoup4==4.12.2
 feedparser==6.0.11
 requests==2.31.0
-g4f>=0.3.0  # Для нейросети
