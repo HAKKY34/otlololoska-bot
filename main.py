@@ -12,8 +12,8 @@ from urllib.parse import urlparse, urljoin, quote
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
-from aiogram.utils import html as aiogram_html
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.markdown import quote_html  # Правильный импорт для 2.x
 from aiohttp import web
 import feedparser
 import json
@@ -158,52 +158,10 @@ def mark_as_posted(url: str, title: str, source: str):
     conn.commit()
     conn.close()
 
-# === ФУНКЦИИ ДЛЯ РАБОТЫ С НЕЙРОСЕТЬЮ ===
-
-async def rewrite_with_ai(title: str, content: str) -> str:
-    """
-    Переписывает текст через нейросеть (G4F)
-    Убирает длинные тире, делает рерайт, форматирует
-    """
-    try:
-        # Формируем промпт для нейросети
-        prompt = f"""Перепиши эту новость для Telegram канала. Требования:
-1. Заголовок сделай жирным
-2. Замени все длинные тире (—, –) на обычные дефисы (-)
-3. Перепиши текст своими словами, сохранив все факты
-4. Раздели на абзацы для читабельности
-5. Убери любую рекламу и призывы подписаться
-6. Текст должен быть на русском
-
-Заголовок: {title}
-Текст новости: {content}
-
-Напиши только готовый пост, без комментариев и объяснений:"""
-
-        # Здесь будет вызов G4F (пока заглушка)
-        # В реальности нужно будет добавить библиотеку g4f
-        
-        # Пока просто чистим текст и возвращаем
-        cleaned_content = clean_text(content)
-        cleaned_title = clean_text(title)
-        
-        # Заменяем длинные тире
-        cleaned_content = cleaned_content.replace('—', '-').replace('–', '-')
-        cleaned_title = cleaned_title.replace('—', '-').replace('–', '-')
-        
-        # Форматируем
-        result = f"<b>{aiogram_html.quote(cleaned_title)}</b>\n\n"
-        result += f"{aiogram_html.quote(cleaned_content[:500])}"
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"Ошибка AI: {e}")
-        # Запасной вариант
-        return f"<b>{aiogram_html.quote(title)}</b>\n\n{aiogram_html.quote(content[:500])}"
+# === ФУНКЦИИ ДЛЯ ОБРАБОТКИ ТЕКСТА ===
 
 def clean_text(text: str) -> str:
-    """Очищает текст от мусора"""
+    """Очищает текст от HTML и мусора"""
     if not text:
         return ""
     text = re.sub(r'<[^>]+>', '', text)
@@ -212,7 +170,37 @@ def clean_text(text: str) -> str:
     # Убираем "Читать дальше" и подобное
     text = re.sub(r'Читать (дальше|полностью).*$', '', text, flags=re.IGNORECASE)
     text = re.sub(r'Подробнее.*$', '', text, flags=re.IGNORECASE)
+    # Заменяем длинные тире
+    text = text.replace('—', '-').replace('–', '-')
     return text.strip()
+
+async def rewrite_text(title: str, content: str) -> str:
+    """
+    Делает рерайт текста и форматирует для Telegram
+    """
+    try:
+        # Очищаем
+        cleaned_title = clean_text(title)
+        cleaned_content = clean_text(content)[:500]
+        
+        # Добавляем эмодзи для красоты
+        emojis = ["🔥", "⚡️", "🎮", "👀", "🤔", "💥", "📢"]
+        if random.random() > 0.5:
+            cleaned_title = f"{random.choice(emojis)} {cleaned_title}"
+        
+        # Форматируем с экранированием
+        formatted_title = quote_html(cleaned_title)
+        formatted_content = quote_html(cleaned_content)
+        
+        result = f"<b>{formatted_title}</b>\n\n"
+        result += f"{formatted_content}"
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Ошибка рерайта: {e}")
+        # Запасной вариант
+        return f"<b>{quote_html(title)}</b>\n\n{quote_html(content[:500])}"
 
 # === ПАРСЕРЫ RSS (только с картинками) ===
 
@@ -221,14 +209,16 @@ def extract_image_from_entry(entry):
     # Пробуем media:content
     if hasattr(entry, 'media_content') and entry.media_content:
         for media in entry.media_content:
-            if media.get('medium') == 'image' or media.get('type', '').startswith('image/'):
+            if isinstance(media, dict) and media.get('medium') == 'image':
+                return media.get('url')
+            if isinstance(media, dict) and media.get('type', '').startswith('image/'):
                 return media.get('url')
     
     # Пробуем enclosure
     if hasattr(entry, 'enclosures') and entry.enclosures:
         for enc in entry.enclosures:
-            if enc.get('type', '').startswith('image/'):
-                return enc.get('href')
+            if hasattr(enc, 'type') and enc.type.startswith('image/'):
+                return enc.href
     
     # Пробуем media:thumbnail
     if hasattr(entry, 'media_thumbnail') and entry.media_thumbnail:
@@ -390,11 +380,7 @@ async def parse_vgtimes():
         logger.error(f"Ошибка vgtimes.ru: {e}")
     return news
 
-# === ПАРСЕРЫ БЕЗ КАРТИНОК (НО МЫ ИХ НЕ ИСПОЛЬЗУЕМ) ===
-# Эти сайты оставляем, но они не пройдут фильтр по картинкам
-# Если добавится RSS с картинками - раскомментировать
-
-# === СБОР НОВОСТЕЙ (ТОЛЬКО С КАРТИНКАМИ) ===
+# === СБОР НОВОСТЕЙ ===
 async def run_parser_with_timeout(parser_func):
     try:
         return await asyncio.wait_for(parser_func(), timeout=PARSER_TIMEOUT)
@@ -406,10 +392,9 @@ async def run_parser_with_timeout(parser_func):
         return []
 
 async def collect_news_to_queue():
-    """Собирает новости только с картинками"""
-    logger.info("🔍 Сканирую источники (только с картинками)...")
+    """Собирает новости со всех сайтов"""
+    logger.info("🔍 Сканирую источники...")
     
-    # Только те парсеры, которые дают картинки
     parsers = [
         run_parser_with_timeout(parse_stopgame),
         run_parser_with_timeout(parse_igromania),
@@ -422,13 +407,11 @@ async def collect_news_to_queue():
     total_new = 0
     for result in results:
         for news_item in result:
-            # Убеждаемся что картинка есть
-            if news_item.get('image_url'):
-                add_to_queue(news_item)
-                total_new += 1
+            add_to_queue(news_item)
+            total_new += 1
     
     queue_size = get_queue_size()
-    logger.info(f"📊 Добавлено в очередь: {total_new} новостей (с картинками). Всего в очереди: {queue_size}")
+    logger.info(f"📊 Добавлено в очередь: {total_new} новостей. Всего в очереди: {queue_size}")
 
 # === ПУБЛИКАЦИЯ ===
 async def publish_from_queue():
@@ -459,8 +442,8 @@ async def publish_from_queue():
         
         logger.info(f"📝 Беру из очереди: {news_item['title'][:50]}...")
         
-        # Переписываем через AI
-        post_text = await rewrite_with_ai(news_item['title'], news_item['content'])
+        # Переписываем
+        post_text = await rewrite_text(news_item['title'], news_item['content'])
         
         # Добавляем подпись
         post_text += "\n\n❤️ / 👎\n\n"
@@ -512,8 +495,8 @@ async def cmd_start(message: types.Message):
     
     await message.answer(
         f"<b>📰 Game Devil News Bot</b>\n\n"
-        f"✅ Мониторю 4+ игровых сайта (только с картинками)\n"
-        f"🤖 Использую нейросеть для рерайта\n"
+        f"✅ Мониторю 4+ игровых сайта\n"
+        f"🖼 Только новости с картинками\n"
         f"⏱ Интервал: {POST_INTERVAL_MINUTES} мин (~{1440//POST_INTERVAL_MINUTES} постов/день)\n"
         f"📚 В очереди сейчас: {queue_size} новостей\n\n"
         f"Команды:\n"
@@ -575,9 +558,8 @@ async def main():
     await run_health_server()
     asyncio.create_task(collector_scheduler())
     asyncio.create_task(publisher_scheduler())
-    logger.info("🤖 Новый умный бот запущен")
+    logger.info("🤖 Новостной бот запущен")
     logger.info(f"⏱ Интервал: {POST_INTERVAL_MINUTES} мин (~{1440//POST_INTERVAL_MINUTES} постов/день)")
-    logger.info("📸 Берём только новости с картинками")
     await dp.start_polling()
 
 if __name__ == "__main__":
