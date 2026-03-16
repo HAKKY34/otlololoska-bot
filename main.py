@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.utils.markdown import quote_html  # Правильный импорт для 2.x
+from aiogram.utils.markdown import quote_html
 from aiohttp import web
 import feedparser
 import json
@@ -24,10 +24,10 @@ TOKEN = os.getenv("BOT_TOKEN", "8776445236:AAHiSvhgKMjvLDlTvNVrWr9ozC18XwQY8J4")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003419109291"))
 DATABASE_PATH = "news_bot.db"
 
-# Интервал между постами (в минутах) - 72 мин = 20 постов/день
+# Интервал между постами (72 мин = 20 постов/день)
 POST_INTERVAL_MINUTES = 72
 CHECK_INTERVAL_MINUTES = 15  # Проверка источников
-PARSER_TIMEOUT = 20
+PARSER_TIMEOUT = 30  # Больше времени на парсинг
 
 # Флаг для предотвращения двойной публикации
 _publishing_lock = False
@@ -158,10 +158,10 @@ def mark_as_posted(url: str, title: str, source: str):
     conn.commit()
     conn.close()
 
-# === ФУНКЦИИ ДЛЯ ОБРАБОТКИ ТЕКСТА ===
+# === ФУНКЦИИ ОБРАБОТКИ ТЕКСТА ===
 
 def clean_text(text: str) -> str:
-    """Очищает текст от HTML и мусора"""
+    """Очищает текст от HTML, мусора и длинных тире"""
     if not text:
         return ""
     text = re.sub(r'<[^>]+>', '', text)
@@ -174,60 +174,55 @@ def clean_text(text: str) -> str:
     text = text.replace('—', '-').replace('–', '-')
     return text.strip()
 
-async def rewrite_text(title: str, content: str) -> str:
-    """
-    Делает рерайт текста и форматирует для Telegram
-    """
-    try:
-        # Очищаем
-        cleaned_title = clean_text(title)
-        cleaned_content = clean_text(content)[:500]
-        
-        # Добавляем эмодзи для красоты
-        emojis = ["🔥", "⚡️", "🎮", "👀", "🤔", "💥", "📢"]
-        if random.random() > 0.5:
-            cleaned_title = f"{random.choice(emojis)} {cleaned_title}"
-        
-        # Форматируем с экранированием
-        formatted_title = quote_html(cleaned_title)
-        formatted_content = quote_html(cleaned_content)
-        
-        result = f"<b>{formatted_title}</b>\n\n"
-        result += f"{formatted_content}"
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"Ошибка рерайта: {e}")
-        # Запасной вариант
-        return f"<b>{quote_html(title)}</b>\n\n{quote_html(content[:500])}"
-
-# === ПАРСЕРЫ RSS (только с картинками) ===
-
-def extract_image_from_entry(entry):
-    """Достаёт картинку из RSS entry"""
-    # Пробуем media:content
-    if hasattr(entry, 'media_content') and entry.media_content:
-        for media in entry.media_content:
-            if isinstance(media, dict) and media.get('medium') == 'image':
-                return media.get('url')
-            if isinstance(media, dict) and media.get('type', '').startswith('image/'):
-                return media.get('url')
+def extract_text_from_article(soup, site_name: str) -> str:
+    """Извлекает текст статьи в зависимости от сайта"""
+    content = ""
     
-    # Пробуем enclosure
-    if hasattr(entry, 'enclosures') and entry.enclosures:
-        for enc in entry.enclosures:
-            if hasattr(enc, 'type') and enc.type.startswith('image/'):
-                return enc.href
+    if site_name == 'gamemag':
+        content_tag = soup.find('div', class_=re.compile(r'content|text|article-body|post-content'))
+    elif site_name == 'vgtimes':
+        content_tag = soup.find('div', class_=re.compile(r'content|text|article-body|post-content'))
+    elif site_name == 'dtf':
+        content_tag = soup.find('div', class_=re.compile(r'content|text|article-body|post-content'))
+    elif site_name == 'shazoo':
+        content_tag = soup.find('div', class_=re.compile(r'content|text|article-body|post-content'))
+    elif site_name == 'playground':
+        content_tag = soup.find('div', class_=re.compile(r'content|text|article-body|post-content'))
+    else:
+        content_tag = soup.find('div', class_=re.compile(r'content|text|article-body'))
     
-    # Пробуем media:thumbnail
-    if hasattr(entry, 'media_thumbnail') and entry.media_thumbnail:
-        return entry.media_thumbnail[0].get('url')
+    if content_tag:
+        # Собираем все параграфы
+        paragraphs = content_tag.find_all('p')
+        content = ' '.join([p.get_text(strip=True) for p in paragraphs])
+    
+    return content
+
+def extract_image_from_article(soup, base_url: str) -> str | None:
+    """Извлекает главную картинку из статьи"""
+    # Ищем разные варианты изображений
+    img_selectors = [
+        'img[class*="main-image"]',
+        'img[class*="featured"]',
+        'img[class*="header-image"]',
+        'img[class*="post-image"]',
+        'img[class*="article-image"]',
+        'img[src*="storage"]',
+        'img[src*="uploads"]',
+        'img[src*="images"]',
+        'img:not([class*="avatar"]):not([class*="icon"])'
+    ]
+    
+    for selector in img_selectors:
+        img = soup.select_one(selector)
+        if img and img.get('src'):
+            return urljoin(base_url, img['src'])
     
     return None
 
+# === ПАРСЕР RSS (стопгейм) ===
 async def parse_stopgame():
-    """stopgame.ru - RSS с картинками"""
+    """stopgame.ru - RSS с картинками и описанием"""
     news = []
     try:
         feed = feedparser.parse("https://stopgame.ru/rss/news.xml")
@@ -235,12 +230,18 @@ async def parse_stopgame():
             if is_posted(entry.link) or is_in_queue(entry.link):
                 continue
             
-            # Берём картинку
-            image_url = extract_image_from_entry(entry)
-            if not image_url:
-                continue  # Пропускаем если нет картинки
+            # Картинка из RSS
+            image_url = None
+            if hasattr(entry, 'media_content') and entry.media_content:
+                for media in entry.media_content:
+                    if isinstance(media, dict) and media.get('type', '').startswith('image/'):
+                        image_url = media.get('url')
+                        break
             
-            # Очищаем контент
+            if not image_url:
+                continue
+            
+            # Контент из RSS (у стопгейма есть полный текст в summary)
             content = clean_text(entry.get('summary', ''))
             
             news.append({
@@ -254,6 +255,7 @@ async def parse_stopgame():
         logger.error(f"Ошибка stopgame.ru: {e}")
     return news
 
+# === ПАРСЕР RSS (игромания) ===
 async def parse_igromania():
     """igromania.ru - RSS с картинками"""
     news = []
@@ -263,10 +265,18 @@ async def parse_igromania():
             if is_posted(entry.link) or is_in_queue(entry.link):
                 continue
             
-            image_url = extract_image_from_entry(entry)
+            # Картинка из RSS
+            image_url = None
+            if hasattr(entry, 'media_content') and entry.media_content:
+                for media in entry.media_content:
+                    if isinstance(media, dict) and media.get('type', '').startswith('image/'):
+                        image_url = media.get('url')
+                        break
+            
             if not image_url:
                 continue
             
+            # Контент из RSS (у игромании есть описание)
             content = clean_text(entry.get('description', ''))
             
             news.append({
@@ -280,105 +290,151 @@ async def parse_igromania():
         logger.error(f"Ошибка igromania.ru: {e}")
     return news
 
+# === ПАРСЕР GAMEMAG (с переходом внутрь) ===
 async def parse_gamemag():
-    """gamemag.ru - парсим HTML, ищем картинки"""
+    """gamemag.ru - парсим список, затем каждую статью"""
     news = []
     try:
         url = "https://gamemag.ru"
         headers = {'User-Agent': 'Mozilla/5.0'}
+        
+        # Шаг 1: Парсим главную страницу
         response = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(response.text, 'html.parser')
         
         items = soup.find_all('div', class_=re.compile(r'news-item|post|article'))
         
-        for item in items[:10]:
+        for item in items[:5]:
             link_tag = item.find('a', href=True)
             if not link_tag:
                 continue
             
-            link = urljoin(url, link_tag['href'])
-            if is_posted(link) or is_in_queue(link):
+            article_url = urljoin(url, link_tag['href'])
+            
+            if is_posted(article_url) or is_in_queue(article_url):
                 continue
             
             title = link_tag.get_text(strip=True)
             if not title or len(title) < 10:
                 continue
             
-            # Ищем картинку
-            img_tag = item.find('img')
-            image_url = None
-            if img_tag and img_tag.get('src'):
-                image_url = urljoin(url, img_tag['src'])
+            logger.info(f"🔍 Захожу в статью gamemag: {article_url}")
             
-            if not image_url:
-                continue  # Пропускаем если нет картинки
-            
-            # Ищем текст
-            content = ""
-            p_tag = item.find('p')
-            if p_tag:
-                content = p_tag.get_text(strip=True)
-            
-            news.append({
-                'title': title,
-                'url': link,
-                'content': content,
-                'image_url': image_url,
-                'source': 'gamemag.ru'
-            })
+            # Шаг 2: Переходим в статью
+            try:
+                article_response = requests.get(article_url, headers=headers, timeout=15)
+                article_soup = BeautifulSoup(article_response.text, 'html.parser')
+                
+                # Извлекаем текст
+                content = extract_text_from_article(article_soup, 'gamemag')
+                content = clean_text(content)[:1000]
+                
+                # Извлекаем картинку
+                image_url = extract_image_from_article(article_soup, article_url)
+                
+                # Если не нашли картинку в статье, берём с главной
+                if not image_url:
+                    img_tag = item.find('img')
+                    if img_tag and img_tag.get('src'):
+                        image_url = urljoin(url, img_tag['src'])
+                
+                if not image_url:
+                    continue
+                
+                news.append({
+                    'title': title,
+                    'url': article_url,
+                    'content': content,
+                    'image_url': image_url,
+                    'source': 'gamemag.ru'
+                })
+                
+                await asyncio.sleep(1)  # Защита от бана
+                
+            except Exception as e:
+                logger.error(f"Ошибка при парсинге статьи {article_url}: {e}")
+                continue
+                
     except Exception as e:
         logger.error(f"Ошибка gamemag.ru: {e}")
     return news
 
+# === ПАРСЕР VGTIMES (с переходом внутрь) ===
 async def parse_vgtimes():
-    """vgtimes.ru/free - парсим бесплатные игры"""
+    """vgtimes.ru/free - парсим список раздач, затем каждую статью"""
     news = []
     try:
         url = "https://vgtimes.ru/free/"
         headers = {'User-Agent': 'Mozilla/5.0'}
+        
         response = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(response.text, 'html.parser')
         
         items = soup.find_all('div', class_=re.compile(r'post|article'))
         
-        for item in items[:10]:
+        for item in items[:5]:
             link_tag = item.find('a', href=True)
             if not link_tag:
                 continue
             
-            link = urljoin(url, link_tag['href'])
-            if is_posted(link) or is_in_queue(link):
+            article_url = urljoin(url, link_tag['href'])
+            
+            if is_posted(article_url) or is_in_queue(article_url):
                 continue
             
             title = link_tag.get_text(strip=True)
             if not title:
                 continue
             
-            # Ищем картинку
-            img_tag = item.find('img')
-            image_url = None
-            if img_tag and img_tag.get('src'):
-                image_url = urljoin(url, img_tag['src'])
+            logger.info(f"🔍 Захожу в статью vgtimes: {article_url}")
             
-            if not image_url:
+            try:
+                article_response = requests.get(article_url, headers=headers, timeout=15)
+                article_soup = BeautifulSoup(article_response.text, 'html.parser')
+                
+                content = extract_text_from_article(article_soup, 'vgtimes')
+                content = clean_text(content)[:1000]
+                
+                image_url = extract_image_from_article(article_soup, article_url)
+                
+                if not image_url:
+                    img_tag = item.find('img')
+                    if img_tag and img_tag.get('src'):
+                        image_url = urljoin(url, img_tag['src'])
+                
+                if not image_url:
+                    continue
+                
+                news.append({
+                    'title': title,
+                    'url': article_url,
+                    'content': content,
+                    'image_url': image_url,
+                    'source': 'vgtimes.ru'
+                })
+                
+                await asyncio.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"Ошибка при парсинге статьи {article_url}: {e}")
                 continue
-            
-            # Ищем текст
-            content = ""
-            p_tag = item.find('p')
-            if p_tag:
-                content = p_tag.get_text(strip=True)
-            
-            news.append({
-                'title': title,
-                'url': link,
-                'content': content,
-                'image_url': image_url,
-                'source': 'vgtimes.ru'
-            })
+                
     except Exception as e:
         logger.error(f"Ошибка vgtimes.ru: {e}")
     return news
+
+# === ПАРСЕРЫ DTF, SHAZOO, PLAYGROUND (заглушки - пока не готовы) ===
+async def parse_dtf():
+    """dtf.ru - заглушка"""
+    return []
+
+async def parse_shazoo():
+    """shazoo.ru - заглушка"""
+    return []
+
+async def parse_playground():
+    """playground.ru - заглушка"""
+    return []
 
 # === СБОР НОВОСТЕЙ ===
 async def run_parser_with_timeout(parser_func):
@@ -393,27 +449,55 @@ async def run_parser_with_timeout(parser_func):
 
 async def collect_news_to_queue():
     """Собирает новости со всех сайтов"""
-    logger.info("🔍 Сканирую источники...")
+    logger.info("🔍 НАЧАЛО СКАНИРОВАНИЯ ИСТОЧНИКОВ")
     
     parsers = [
         run_parser_with_timeout(parse_stopgame),
         run_parser_with_timeout(parse_igromania),
         run_parser_with_timeout(parse_gamemag),
         run_parser_with_timeout(parse_vgtimes),
+        # run_parser_with_timeout(parse_dtf),      # Отключено до доработки
+        # run_parser_with_timeout(parse_shazoo),   # Отключено до доработки
+        # run_parser_with_timeout(parse_playground), # Отключено до доработки
     ]
     
     results = await asyncio.gather(*parsers)
     
     total_new = 0
-    for result in results:
+    for parser_name, result in zip(['stopgame', 'igromania', 'gamemag', 'vgtimes'], results):
+        logger.info(f"📊 {parser_name}: нашёл {len(result)} новостей")
         for news_item in result:
             add_to_queue(news_item)
             total_new += 1
     
     queue_size = get_queue_size()
-    logger.info(f"📊 Добавлено в очередь: {total_new} новостей. Всего в очереди: {queue_size}")
+    logger.info(f"📦 ИТОГО: Добавлено {total_new} новостей. Всего в очереди: {queue_size}")
 
 # === ПУБЛИКАЦИЯ ===
+async def rewrite_text(title: str, content: str) -> str:
+    """Делает рерайт текста"""
+    try:
+        cleaned_title = clean_text(title)
+        cleaned_content = clean_text(content)[:500]
+        
+        # Добавляем эмодзи
+        emojis = ["🔥", "⚡️", "🎮", "👀", "🤔", "💥", "📢", "🕹️", "🎯", "💬"]
+        if random.random() > 0.5:
+            cleaned_title = f"{random.choice(emojis)} {cleaned_title}"
+        
+        # Форматируем
+        formatted_title = quote_html(cleaned_title)
+        formatted_content = quote_html(cleaned_content)
+        
+        result = f"<b>{formatted_title}</b>\n\n"
+        result += f"{formatted_content}"
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Ошибка рерайта: {e}")
+        return f"<b>{quote_html(title)}</b>\n\n{quote_html(content[:500])}"
+
 async def publish_from_queue():
     """Публикует одну новость из очереди"""
     global _publishing_lock
@@ -425,16 +509,14 @@ async def publish_from_queue():
     _publishing_lock = True
     
     try:
-        # Проверяем интервал
         last_time = get_last_post_time()
         minutes_passed = (datetime.now() - last_time).total_seconds() / 60
         
-        if minutes_passed < POST_INTERVAL_MINUTES:
+        if minutes_passed < POST_INTERVAL_MINUTES and last_time > datetime.min:
             next_post = last_time + timedelta(minutes=POST_INTERVAL_MINUTES)
-            logger.info(f"⏳ Интервал: прошло {minutes_passed:.0f} мин, нужно до {next_post.strftime('%H:%M')}")
+            logger.info(f"⏳ Интервал: прошло {minutes_passed:.0f} мин, следующий пост после {next_post.strftime('%H:%M')}")
             return False
         
-        # Берём новость из очереди
         news_item = get_from_queue()
         if not news_item:
             logger.info("📭 Очередь пуста")
@@ -442,14 +524,10 @@ async def publish_from_queue():
         
         logger.info(f"📝 Беру из очереди: {news_item['title'][:50]}...")
         
-        # Переписываем
         post_text = await rewrite_text(news_item['title'], news_item['content'])
-        
-        # Добавляем подпись
         post_text += "\n\n❤️ / 👎\n\n"
         post_text += '👉 <a href="https://t.me/gamesdevil">Game Devil</a>'
         
-        # Публикуем с картинкой
         try:
             await bot.send_photo(
                 chat_id=CHANNEL_ID,
@@ -458,12 +536,11 @@ async def publish_from_queue():
                 parse_mode="HTML"
             )
             
-            # Отмечаем как опубликованное
             mark_as_posted(news_item['url'], news_item['title'], news_item['source'])
             remove_from_queue(news_item['id'])
             update_last_post_time()
             
-            logger.info(f"✅ Опубликовано с фото: {news_item['title'][:50]}...")
+            logger.info(f"✅ Опубликовано: {news_item['title'][:50]}...")
             logger.info(f"📊 Осталось в очереди: {get_queue_size()}")
             
             return True
@@ -486,7 +563,7 @@ async def publisher_scheduler():
     logger.info(f"📢 Паблишер запущен (интервал {POST_INTERVAL_MINUTES} мин)")
     while True:
         await publish_from_queue()
-        await asyncio.sleep(120)  # Проверяем каждые 2 минуты
+        await asyncio.sleep(60)
 
 # === КОМАНДЫ ===
 @dp.message_handler(commands=['start'])
@@ -495,10 +572,11 @@ async def cmd_start(message: types.Message):
     
     await message.answer(
         f"<b>📰 Game Devil News Bot</b>\n\n"
-        f"✅ Мониторю 4+ игровых сайта\n"
-        f"🖼 Только новости с картинками\n"
+        f"✅ Мониторю 4 источника\n"
+        f"🔍 Захожу в каждую новость\n"
+        f"🖼 Только с картинками\n"
         f"⏱ Интервал: {POST_INTERVAL_MINUTES} мин (~{1440//POST_INTERVAL_MINUTES} постов/день)\n"
-        f"📚 В очереди сейчас: {queue_size} новостей\n\n"
+        f"📚 В очереди: {queue_size}\n\n"
         f"Команды:\n"
         f"/stats — статистика\n"
         f"/queue — очередь\n"
@@ -538,7 +616,7 @@ async def cmd_post(message: types.Message):
     if success:
         await message.answer("✅ Пост опубликован!")
     else:
-        await message.answer("❌ Не удалось опубликовать (нет новостей или рано)")
+        await message.answer("❌ Не удалось (нет новостей или рано)")
 
 # === HEALTH CHECK ===
 async def handle_health(request):
@@ -558,7 +636,7 @@ async def main():
     await run_health_server()
     asyncio.create_task(collector_scheduler())
     asyncio.create_task(publisher_scheduler())
-    logger.info("🤖 Новостной бот запущен")
+    logger.info("🤖 Новостной бот (с переходом по ссылкам) запущен")
     logger.info(f"⏱ Интервал: {POST_INTERVAL_MINUTES} мин (~{1440//POST_INTERVAL_MINUTES} постов/день)")
     await dp.start_polling()
 
